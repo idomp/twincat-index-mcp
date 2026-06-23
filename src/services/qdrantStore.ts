@@ -2,6 +2,7 @@ import { QdrantClient } from "@qdrant/js-client-rest";
 import crypto from "node:crypto";
 import path from "node:path";
 import { QDRANT_URL, VECTOR_SIZE } from "../utils/constants.js";
+import type { ProjectManifest } from "../utils/fileScanner.js";
 
 const client = new QdrantClient({ url: QDRANT_URL });
 
@@ -151,6 +152,7 @@ export async function storeMetadata(
 	collectionName: string,
 	projectPath: string,
 	fileCount: number,
+	manifest?: ProjectManifest,
 ): Promise<void> {
 	await client.upsert(collectionName, {
 		points: [
@@ -162,10 +164,34 @@ export async function storeMetadata(
 					projectPath,
 					indexedAt: new Date().toISOString(),
 					fileCount,
+					...(manifest ? { manifest } : {}),
 				},
 			},
 		],
 	});
+}
+
+/**
+ * Retrieve the stored per-file manifest for a project (from its metadata point),
+ * resolving via the project's alias. Returns null when absent.
+ */
+export async function getProjectManifest(projectPath: string): Promise<ProjectManifest | null> {
+	const alias = projectCollectionName(projectPath);
+	try {
+		const points = await client.retrieve(alias, {
+			ids: [METADATA_POINT_ID],
+			with_payload: true,
+		});
+		if (points.length === 0) return null;
+		const payload = points[0].payload as Record<string, unknown> | null;
+		const manifest = payload?.manifest;
+		if (manifest && typeof manifest === "object" && !Array.isArray(manifest)) {
+			return manifest as ProjectManifest;
+		}
+		return null;
+	} catch {
+		return null;
+	}
 }
 
 /**

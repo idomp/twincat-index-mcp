@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { scanForTwincatFiles } from "../utils/fileScanner.js";
+import { scanForTwincatFiles, computeManifest } from "../utils/fileScanner.js";
 import { XML_EXTENSIONS, HMI_EXTENSIONS } from "../utils/constants.js";
 import { extractStFromXml } from "../services/xmlExtractor.js";
 import { extractTextList, extractFromTcVIS, extractFromTcVMO } from "../services/hmiExtractor.js";
@@ -16,9 +16,13 @@ import {
 	atomicSwapCollection,
 	type ChunkWithEmbedding,
 } from "../services/qdrantStore.js";
+import { watchProject } from "../services/watcher.js";
+import { acquireProjectLock } from "../services/lock.js";
 
 /**
- * Index a TwinCAT project directory: scan → extract → parse → embed → store.
+ * Public entry: validate, take a cross-process lock, then index. The lock stops
+ * two server instances (e.g. Claude Code + VS Code) from reindexing the same
+ * project concurrently and racing the alias swap. See WATCHER.md.
  */
 export async function handleIndex(args: { path: string }): Promise<string> {
 	const projectPath = path.resolve(args.path);
@@ -29,6 +33,21 @@ export async function handleIndex(args: { path: string }): Promise<string> {
 		throw new Error(`"${projectPath}" is not a valid directory.`);
 	}
 
+	const lock = await acquireProjectLock(projectPath);
+	if (!lock) {
+		return `⏭️  Skipped "${projectPath}": another process is already indexing it. Re-run twincat_index shortly if you need the latest.`;
+	}
+	try {
+		return await indexProject(projectPath);
+	} finally {
+		await lock.release().catch(() => {});
+	}
+}
+
+/**
+ * Index a TwinCAT project directory: scan → extract → parse → embed → store.
+ */
+async function indexProject(projectPath: string): Promise<string> {
 	// 2. Scan for TwinCAT files
 	const files = await scanForTwincatFiles(projectPath);
 	if (files.length === 0) {
@@ -124,11 +143,19 @@ export async function handleIndex(args: { path: string }): Promise<string> {
 
 		await upsertChunks(tempName, chunksWithEmbeddings);
 
-		// 8. Store metadata
-		await storeMetadata(tempName, projectPath.replace(/\\/g, "/"), files.length);
+		// 8. Store metadata + per-file manifest (size/mtime/sha) for content-aware
+		// staleness checks on startup.
+		const manifest = await computeManifest(projectPath, files);
+		await storeMetadata(tempName, projectPath.replace(/\\/g, "/"), files.length, manifest);
 
 		// 9. Atomic swap: alias → new collection, delete old
 		await atomicSwapCollection(aliasName, tempName);
+
+		// Keep this project under the W1 auto-reindex watcher. Idempotent;
+		// no-op when already watching or when TWINCAT_WATCH=0. See WATCHER.md.
+		void watchProject(projectPath).catch((werr) => {
+			console.error(`[watcher] watchProject failed for ${projectPath}: ${werr instanceof Error ? werr.message : String(werr)}`);
+		});
 	} catch (err) {
 		// Clean up temp collection on failure
 		await clearCollection(tempName).catch(() => {});

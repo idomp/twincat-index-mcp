@@ -27,8 +27,10 @@ when source files change, so search results stay fresh without manually re-runni
   This covers edits made while the MCP was not running, and a `git pull` that only
   bumps mtimes (without changing bytes) does **not** trigger a reindex.
 - Cross-process safety: a per-project lock file (OS temp dir) prevents two server
-  instances (e.g. Claude Code + VS Code Copilot) from reindexing the same project
-  at once and racing the alias swap; the second instance skips with a log line.
+  instances (e.g. Claude Code + VS Code Copilot) from racing the alias swap. A live
+  holder makes others skip (and the watcher retries shortly); a crashed holder's lock
+  goes stale and can be stolen, and the indexer re-checks lock ownership right before
+  the alias swap, dropping a superseded build instead of overwriting the fresh index.
 
 ### Lifecycle
 The watcher runs for the life of the MCP process (= your editor/Claude Code
@@ -130,5 +132,11 @@ per-project cross-process lock (`lock.ts`) so duplicate client instances can't r
 reindexes; content-aware startup staleness (per-file manifest) so a `git pull` no
 longer triggers needless reindexes; `stopWatchers()` + SIGINT/SIGTERM shutdown; and
 smaller fixes (debounce parse, ignore-on-undefined-stats, fire-and-forget `.catch`).
+A second Codex + GLM re-review hardened it further: the manifest is now built from
+the exact bytes embedded (no read/embed TOCTOU); the indexer re-checks lock ownership
+(`isValid()`) before the alias swap so a stolen-lock race can't overwrite a fresh
+index; the watcher retries on a lock-skip instead of treating it as done; and
+`listCollections` no longer fetches the manifest payload.
+
 W2 (incremental per-file reindex) remains the open follow-up — the manifest now
 stored at index time can drive it.

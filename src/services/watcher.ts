@@ -5,6 +5,7 @@ import type { Stats } from "node:fs";
 import { listCollections, getProjectManifest } from "./qdrantStore.js";
 import { scanForTwincatFiles } from "../utils/fileScanner.js";
 import { TWINCAT_EXTENSIONS } from "../utils/constants.js";
+import { isDeferredReindex } from "../utils/reindexResult.js";
 
 /**
  * W1 auto-reindex file watcher.
@@ -105,9 +106,15 @@ async function runReindex(key: string): Promise<void> {
 	st.running = true;
 	try {
 		log(`reindexing ${key} ...`);
-		const result = await reindexFn({ path: key });
-		const firstLine = (result ?? "").split("\n")[0] ?? "";
-		log(`reindexed ${key}: ${firstLine}`);
+		const result = (await reindexFn({ path: key })) ?? "";
+		if (isDeferredReindex(result)) {
+			// Another instance holds/held the lock — retry after the debounce so this
+			// change isn't dropped (instead of treating the skip as a success).
+			log(`deferred (locked by another instance), will retry: ${key}`);
+			st.pending = true;
+		} else {
+			log(`reindexed ${key}: ${result.split("\n")[0] ?? ""}`);
+		}
 	} catch (err) {
 		log(`reindex failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
 	} finally {

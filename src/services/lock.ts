@@ -11,8 +11,13 @@ import crypto from "node:crypto";
  * Implementation: an exclusive lock file under the OS temp dir, keyed by a hash
  * of the resolved project path, holding {pid, host, ts}. A lock older than
  * TWINCAT_LOCK_TTL_MS (default 10 min) is treated as stale (crashed holder) and
- * may be stolen. Fails OPEN: if the lock infrastructure itself errors, a no-op
- * lock is returned so indexing is never blocked by lock problems.
+ * may be stolen. Fails OPEN: if the lock infrastructure errors, a no-op lock is
+ * returned so indexing is never blocked by lock problems.
+ *
+ * Correctness note: two processes that both observe a stale lock can both steal
+ * and proceed to index. That is harmless because the irreversible step — the
+ * alias swap in handleIndex — first calls isValid(), and only the process that
+ * currently owns the lock file (matching pid + ts) performs the swap.
  */
 
 const LOCK_DIR = path.join(os.tmpdir(), "twincat-index-locks");
@@ -21,9 +26,15 @@ const STALE_MS = Number.isFinite(_ttlRaw) && _ttlRaw > 0 ? _ttlRaw : 10 * 60 * 1
 
 export interface ProjectLock {
 	release(): Promise<void>;
+	/** True while THIS process still owns the lock file (re-reads it; pid + ts). */
+	isValid(): Promise<boolean>;
 }
 
-const NOOP_LOCK: ProjectLock = { release: async () => {} };
+const NOOP_LOCK: ProjectLock = { release: async () => {}, isValid: async () => true };
+
+function log(msg: string): void {
+	console.error(`[lock] ${msg}`);
+}
 
 function lockPath(projectPath: string): string {
 	const norm = path.resolve(projectPath).replace(/\\/g, "/").toLowerCase();
@@ -46,21 +57,25 @@ async function tryCreate(file: string, payload: string): Promise<"ok" | "exists"
 	}
 }
 
-function ownedLock(file: string): ProjectLock {
+function makeLock(file: string, myTs: number): ProjectLock {
 	let released = false;
+	const owns = async (): Promise<boolean> => {
+		try {
+			const raw = await fsp.readFile(file, "utf-8");
+			const data = JSON.parse(raw) as { pid?: number; ts?: number };
+			return data.pid === process.pid && data.ts === myTs;
+		} catch {
+			return false; // missing/corrupt — we no longer own it
+		}
+	};
 	return {
+		isValid: owns,
 		release: async () => {
 			if (released) return;
 			released = true;
-			try {
-				const raw = await fsp.readFile(file, "utf-8");
-				const data = JSON.parse(raw) as { pid?: number };
-				// Only delete if it's still ours — never remove another process's lock.
-				if (data.pid === process.pid) {
-					await fsp.rm(file, { force: true });
-				}
-			} catch {
-				// Unreadable/corrupt — leave it; the TTL will reclaim it.
+			// Only remove the lock if it is still ours — never delete a new owner's lock.
+			if (await owns()) {
+				await fsp.rm(file, { force: true }).catch(() => {});
 			}
 		},
 	};
@@ -68,27 +83,27 @@ function ownedLock(file: string): ProjectLock {
 
 /**
  * Try to acquire the project lock. Returns a ProjectLock on success (the caller
- * MUST release it), or null when another live process holds it (the caller
- * should skip). Never throws.
+ * MUST release it and SHOULD call isValid() before any irreversible step), or
+ * null when another live process holds it (the caller should skip). Never throws.
  */
 export async function acquireProjectLock(projectPath: string): Promise<ProjectLock | null> {
 	const file = lockPath(projectPath);
-	const payload = JSON.stringify({
-		pid: process.pid,
-		host: os.hostname(),
-		ts: Date.now(),
-		project: path.resolve(projectPath),
-	});
+	const myTs = Date.now();
+	const payload = JSON.stringify({ pid: process.pid, host: os.hostname(), ts: myTs, project: path.resolve(projectPath) });
 
 	try {
 		await fsp.mkdir(LOCK_DIR, { recursive: true });
-	} catch {
-		return NOOP_LOCK; // can't create the lock dir — fail open
+	} catch (err) {
+		log(`lock dir unavailable, proceeding unlocked: ${err instanceof Error ? err.message : String(err)}`);
+		return NOOP_LOCK;
 	}
 
 	const first = await tryCreate(file, payload);
-	if (first === "ok") return ownedLock(file);
-	if (first === "error") return NOOP_LOCK; // unexpected FS error — fail open
+	if (first === "ok") return makeLock(file, myTs);
+	if (first === "error") {
+		log(`lock create failed, proceeding unlocked: ${file}`);
+		return NOOP_LOCK;
+	}
 
 	// Lock exists — is it stale?
 	let stale = false;
@@ -101,10 +116,12 @@ export async function acquireProjectLock(projectPath: string): Promise<ProjectLo
 	}
 	if (!stale) return null; // held by a live owner — caller should skip
 
-	// Steal the stale lock.
+	// Steal the stale lock. (See "Correctness note" above: the pre-swap isValid()
+	// check makes a double-steal harmless — at most one process swaps.)
 	await fsp.rm(file, { force: true }).catch(() => {});
 	const second = await tryCreate(file, payload);
-	if (second === "ok") return ownedLock(file);
+	if (second === "ok") return makeLock(file, myTs);
 	if (second === "exists") return null; // someone else grabbed it first
-	return NOOP_LOCK; // unexpected error — fail open
+	log(`lock re-create failed after stale steal, proceeding unlocked: ${file}`);
+	return NOOP_LOCK;
 }

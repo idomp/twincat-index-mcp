@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { scanForTwincatFiles, computeManifest } from "../utils/fileScanner.js";
+import crypto from "node:crypto";
+import { scanForTwincatFiles } from "../utils/fileScanner.js";
+import type { ProjectManifest } from "../utils/fileScanner.js";
 import { XML_EXTENSIONS, HMI_EXTENSIONS } from "../utils/constants.js";
 import { extractStFromXml } from "../services/xmlExtractor.js";
 import { extractTextList, extractFromTcVIS, extractFromTcVMO } from "../services/hmiExtractor.js";
@@ -17,7 +19,8 @@ import {
 	type ChunkWithEmbedding,
 } from "../services/qdrantStore.js";
 import { watchProject } from "../services/watcher.js";
-import { acquireProjectLock } from "../services/lock.js";
+import { acquireProjectLock, type ProjectLock } from "../services/lock.js";
+import { LOCK_DEFERRED_NOTE, LOCK_SUPERSEDED_NOTE } from "../utils/reindexResult.js";
 
 /**
  * Public entry: validate, take a cross-process lock, then index. The lock stops
@@ -35,10 +38,10 @@ export async function handleIndex(args: { path: string }): Promise<string> {
 
 	const lock = await acquireProjectLock(projectPath);
 	if (!lock) {
-		return `⏭️  Skipped "${projectPath}": another process is already indexing it. Re-run twincat_index shortly if you need the latest.`;
+		return `${LOCK_DEFERRED_NOTE} "${projectPath}". Re-run twincat_index shortly if you need the latest.`;
 	}
 	try {
-		return await indexProject(projectPath);
+		return await indexProject(projectPath, lock);
 	} finally {
 		await lock.release().catch(() => {});
 	}
@@ -47,21 +50,39 @@ export async function handleIndex(args: { path: string }): Promise<string> {
 /**
  * Index a TwinCAT project directory: scan → extract → parse → embed → store.
  */
-async function indexProject(projectPath: string): Promise<string> {
+async function indexProject(projectPath: string, lock: ProjectLock): Promise<string> {
 	// 2. Scan for TwinCAT files
 	const files = await scanForTwincatFiles(projectPath);
 	if (files.length === 0) {
 		throw new Error(`No TwinCAT files found in "${projectPath}".`);
 	}
 
-	// 3. Extract and parse all files (parser initialized lazily)
+	// 3. Extract and parse all files (parser initialized lazily). The per-file
+	// manifest is built from the EXACT bytes read here, so content-aware staleness
+	// can never disagree with what was actually embedded (no read/embed TOCTOU).
 	const allChunks: Array<CodeChunk & { filePath: string; absolutePath: string }> = [];
+	const manifest: ProjectManifest = {};
 	let parseErrors = 0;
 
 	for (const filePath of files) {
 		try {
-			let content = await fs.readFile(filePath, "utf-8");
+			const rawContent = await fs.readFile(filePath, "utf-8");
 			const ext = path.extname(filePath).slice(1).toLowerCase();
+			const relPath = path.relative(projectPath, filePath).replace(/\\/g, "/");
+
+			// Manifest entry from the bytes we just read (ties staleness to indexed content).
+			try {
+				const fstat = await fs.stat(filePath);
+				manifest[relPath] = {
+					size: fstat.size,
+					mtimeMs: fstat.mtimeMs,
+					sha: crypto.createHash("sha256").update(rawContent).digest("hex"),
+				};
+			} catch {
+				// stat failed — leave this file out of the manifest
+			}
+
+			let content = rawContent;
 
 			// HMI files: extract directly, skip tree-sitter entirely
 			if (HMI_EXTENSIONS.has(ext)) {
@@ -74,7 +95,6 @@ async function indexProject(projectPath: string): Promise<string> {
 					hmiChunks = extractFromTcVMO(content, path.basename(filePath));
 				}
 
-				const relPath = path.relative(projectPath, filePath).replace(/\\/g, "/");
 				for (const chunk of hmiChunks) {
 					allChunks.push({
 						...chunk,
@@ -99,7 +119,6 @@ async function indexProject(projectPath: string): Promise<string> {
 				// Parser unavailable — parseStCode will use fallback chunking
 			}
 			const chunks = parseStCode(content, filePath);
-			const relPath = path.relative(projectPath, filePath).replace(/\\/g, "/");
 
 			for (const chunk of chunks) {
 				allChunks.push({
@@ -143,10 +162,16 @@ async function indexProject(projectPath: string): Promise<string> {
 
 		await upsertChunks(tempName, chunksWithEmbeddings);
 
-		// 8. Store metadata + per-file manifest (size/mtime/sha) for content-aware
-		// staleness checks on startup.
-		const manifest = await computeManifest(projectPath, files);
+		// 8. Store metadata + the per-file manifest built above (content-aware staleness).
 		await storeMetadata(tempName, projectPath.replace(/\\/g, "/"), files.length, manifest);
+
+		// Before the irreversible alias swap, confirm we still hold the lock. Another
+		// instance may have stolen a stale lock and already reindexed; if so, drop our
+		// (older) build rather than overwriting the fresh collection.
+		if (!(await lock.isValid())) {
+			await clearCollection(tempName).catch(() => {});
+			return `${LOCK_SUPERSEDED_NOTE} "${projectPath}".`;
+		}
 
 		// 9. Atomic swap: alias → new collection, delete old
 		await atomicSwapCollection(aliasName, tempName);

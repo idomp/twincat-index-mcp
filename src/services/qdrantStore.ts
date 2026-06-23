@@ -335,7 +335,7 @@ export async function listCollections(): Promise<CollectionInfo[]> {
 			try {
 				const metaPoints = await client.retrieve(name, {
 					ids: [METADATA_POINT_ID],
-					with_payload: true,
+					with_payload: ["projectPath", "indexedAt", "fileCount"], // exclude the (large) manifest
 				});
 				if (metaPoints.length > 0) {
 					const payload = metaPoints[0].payload as Record<string, unknown>;

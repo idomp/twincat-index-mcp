@@ -26,6 +26,8 @@ void startWatchers(handleIndex).catch((err) => {
 // Graceful shutdown: close file watchers + clear timers before exiting.
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
 	process.on(sig, () => {
-		void stopWatchers().finally(() => process.exit(0));
+		void stopWatchers()
+			.catch(() => {})
+			.finally(() => process.exit(0));
 	});
 }

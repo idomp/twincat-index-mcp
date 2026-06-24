@@ -65,23 +65,28 @@ async function indexProject(projectPath: string, lock: ProjectLock): Promise<str
 	let parseErrors = 0;
 
 	for (const filePath of files) {
+		const relPath = path.relative(projectPath, filePath).replace(/\\/g, "/");
+
+		// Stat BEFORE reading so the manifest's size/mtime describe the same snapshot
+		// as the bytes we hash. A file that can't be read gets a sentinel entry
+		// (sha: "") so the startup staleness check doesn't reindex it on every boot.
+		let rawContent: string;
 		try {
-			const rawContent = await fs.readFile(filePath, "utf-8");
+			const fstat = await fs.stat(filePath);
+			rawContent = await fs.readFile(filePath, "utf-8");
+			manifest[relPath] = {
+				size: fstat.size,
+				mtimeMs: fstat.mtimeMs,
+				sha: crypto.createHash("sha256").update(rawContent).digest("hex"),
+			};
+		} catch {
+			manifest[relPath] = { size: -1, mtimeMs: -1, sha: "" }; // unreadable sentinel
+			parseErrors++;
+			continue;
+		}
+
+		try {
 			const ext = path.extname(filePath).slice(1).toLowerCase();
-			const relPath = path.relative(projectPath, filePath).replace(/\\/g, "/");
-
-			// Manifest entry from the bytes we just read (ties staleness to indexed content).
-			try {
-				const fstat = await fs.stat(filePath);
-				manifest[relPath] = {
-					size: fstat.size,
-					mtimeMs: fstat.mtimeMs,
-					sha: crypto.createHash("sha256").update(rawContent).digest("hex"),
-				};
-			} catch {
-				// stat failed — leave this file out of the manifest
-			}
-
 			let content = rawContent;
 
 			// HMI files: extract directly, skip tree-sitter entirely

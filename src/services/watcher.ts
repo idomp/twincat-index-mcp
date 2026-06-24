@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import crypto from "node:crypto";
-import type { Stats } from "node:fs";
+import { constants as FSC, type Stats } from "node:fs";
 import { listCollections, getProjectManifest } from "./qdrantStore.js";
 import { scanForTwincatFiles } from "../utils/fileScanner.js";
 import { TWINCAT_EXTENSIONS } from "../utils/constants.js";
@@ -37,12 +37,16 @@ const TWINCAT_EXT_SET = new Set(TWINCAT_EXTENSIONS.map((e) => e.toLowerCase()));
 // otherwise produce setTimeout(<0) that fires immediately and defeats debouncing.
 const _debounceRaw = Number.parseInt(process.env.TWINCAT_WATCH_DEBOUNCE_MS ?? "", 10);
 const DEBOUNCE_MS = Number.isFinite(_debounceRaw) && _debounceRaw >= 0 ? _debounceRaw : 20000;
+// Minimum delay for lock-deferred retries, so a 0ms debounce can't busy-loop while
+// another instance holds the lock.
+const RETRY_FLOOR_MS = 2000;
 
 interface ProjectWatchState {
 	watcher: ChokidarWatcher | null;
 	timer: NodeJS.Timeout | null;
 	running: boolean;
 	pending: boolean;
+	deferred: boolean; // last run was a lock-skip → next retry uses the floor delay
 }
 
 const watched = new Map<string, ProjectWatchState>(); // key: resolved project path
@@ -76,7 +80,7 @@ function isIgnored(p: string, stats?: Stats): boolean {
 	return false;
 }
 
-function scheduleReindex(key: string): void {
+function scheduleReindex(key: string, delayMs: number = DEBOUNCE_MS): void {
 	const st = watched.get(key);
 	if (!st) return;
 	// A reindex is already in flight — queue exactly one trailing pass instead of
@@ -93,7 +97,7 @@ function scheduleReindex(key: string): void {
 	st.timer = setTimeout(() => {
 		st.timer = null;
 		void runReindex(key);
-	}, DEBOUNCE_MS);
+	}, delayMs);
 }
 
 async function runReindex(key: string): Promise<void> {
@@ -108,10 +112,11 @@ async function runReindex(key: string): Promise<void> {
 		log(`reindexing ${key} ...`);
 		const result = (await reindexFn({ path: key })) ?? "";
 		if (isDeferredReindex(result)) {
-			// Another instance holds/held the lock — retry after the debounce so this
-			// change isn't dropped (instead of treating the skip as a success).
+			// Another instance holds/held the lock — retry (with a floor delay so a
+			// 0ms debounce can't busy-loop) instead of treating the skip as a success.
 			log(`deferred (locked by another instance), will retry: ${key}`);
 			st.pending = true;
+			st.deferred = true;
 		} else {
 			log(`reindexed ${key}: ${result.split("\n")[0] ?? ""}`);
 		}
@@ -121,7 +126,9 @@ async function runReindex(key: string): Promise<void> {
 		st.running = false;
 		if (st.pending) {
 			st.pending = false;
-			scheduleReindex(key);
+			const delay = st.deferred ? Math.max(DEBOUNCE_MS, RETRY_FLOOR_MS) : DEBOUNCE_MS;
+			st.deferred = false;
+			scheduleReindex(key, delay);
 		}
 	}
 }
@@ -136,7 +143,7 @@ export async function watchProject(projectPath: string): Promise<void> {
 	const key = normalize(projectPath);
 	if (watched.has(key)) return;
 	// Reserve the slot up front so concurrent calls don't double-watch.
-	watched.set(key, { watcher: null, timer: null, running: false, pending: false });
+	watched.set(key, { watcher: null, timer: null, running: false, pending: false, deferred: false });
 
 	let watch: (paths: string, opts?: Record<string, unknown>) => ChokidarWatcher;
 	try {
@@ -256,6 +263,17 @@ async function isStale(projectPath: string): Promise<boolean> {
 		if (!entry) {
 			log(`new file: ${rel}`);
 			return true;
+		}
+		// Sentinel (sha "") = unreadable at index time. Only stale if it became
+		// readable since; otherwise skip so we don't reindex it on every boot.
+		if (entry.sha === "") {
+			try {
+				await fs.access(f, FSC.R_OK);
+				log(`now readable: ${rel}`);
+				return true;
+			} catch {
+				continue;
+			}
 		}
 		let s: Stats;
 		try {

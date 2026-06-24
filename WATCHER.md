@@ -138,5 +138,13 @@ the exact bytes embedded (no read/embed TOCTOU); the indexer re-checks lock owne
 index; the watcher retries on a lock-skip instead of treating it as done; and
 `listCollections` no longer fetches the manifest payload.
 
+A third pass (Codex + GLM + DeepSeek) added the last cheap hardening: the per-file
+`stat` is taken **before** the read (snapshot-consistent manifest); unreadable files
+get a sentinel manifest entry (`sha: ""`) so they aren't reindexed on every boot; and
+lock-deferred retries use a floor delay (`RETRY_FLOOR_MS`) so a `0ms` debounce can't
+busy-loop. The remaining flagged items are accepted residuals that require a >10-min
+reindex (past the lock TTL) or microsecond-perfect multi-process interleaves; the
+airtight path would be a heartbeat lock or `proper-lockfile`, not currently warranted.
+
 W2 (incremental per-file reindex) remains the open follow-up — the manifest now
 stored at index time can drive it.

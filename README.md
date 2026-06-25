@@ -26,9 +26,9 @@ An MCP (Model Context Protocol) server that indexes Beckhoff TwinCAT 3 PLC and H
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) 18+
+- [Node.js](https://nodejs.org/) 18+ (on **Node 26+** see [Node.js compatibility](#nodejs-compatibility))
 - [Qdrant](https://qdrant.tech/) running locally (default: `http://localhost:6333`)
-- An [OpenAI API key](https://platform.openai.com/api-keys)
+- An [OpenAI API key](https://platform.openai.com/api-keys) — **or** any OpenAI-compatible embeddings endpoint (e.g. a local [Ollama](https://ollama.com) server; see [Local embeddings with Ollama](#local-embeddings-with-ollama))
 
 Start Qdrant with Docker:
 
@@ -51,10 +51,42 @@ Set the following environment variables (or add them to your MCP client config):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAI_API_KEY` | — | **Required.** OpenAI API key for embeddings |
+| `OPENAI_API_KEY` | — | **Required.** API key for embeddings. For a local Ollama server any non-empty value works (e.g. `ollama`). |
+| `OPENAI_BASE_URL` | OpenAI default | Optional. Point the OpenAI SDK at any OpenAI-compatible endpoint, e.g. `http://localhost:11434/v1` for Ollama. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
 | `VECTOR_SIZE` | `1536` | Must match the embedding model's output dimension |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant server URL |
+
+### Local embeddings with Ollama
+
+The server uses the OpenAI Node SDK, which honors the `OPENAI_BASE_URL` environment variable — so you can run **fully local, no API key, no cloud** by pointing it at an [Ollama](https://ollama.com) server's OpenAI-compatible endpoint. No code changes required.
+
+1. Pull an embedding model, e.g. `ollama pull qwen3-embedding:8b` (dim 4096) or the smaller `qwen3-embedding:4b` (dim 2560) / `qwen3-embedding:0.6b` (dim 1024).
+2. Set these env vars in your MCP client config:
+
+```jsonc
+"env": {
+  "OPENAI_BASE_URL": "http://localhost:11434/v1",
+  "OPENAI_API_KEY": "ollama",                 // any non-empty placeholder
+  "OPENAI_EMBEDDING_MODEL": "qwen3-embedding:8b",
+  "VECTOR_SIZE": "4096",                       // MUST match the model's output dim
+  "QDRANT_URL": "http://localhost:6333"
+}
+```
+
+`VECTOR_SIZE` must equal the model's embedding dimension or indexing fails fast with a dimension-mismatch error. Verify a model's dimension with:
+
+```bash
+curl -s http://localhost:11434/v1/embeddings -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-embedding:8b","input":"test"}' | jq '.data[0].embedding | length'
+```
+
+### Node.js compatibility
+
+`@qdrant/js-client-rest` depends on **undici 6** and passes its own undici `Agent` as a `dispatcher` to the global `fetch`. On **Node.js 26+** (which bundles undici 8) this cross-major mismatch makes every Qdrant call fail with `fetch failed` / `UND_ERR_INVALID_ARG: invalid onError method` (embeddings are unaffected, so indexing appears to run, then dies at the Qdrant upsert/search step). Two options:
+
+- **Run on Node.js 22 LTS** (bundles a matching undici), or
+- Keep the included [`patch-package`](https://www.npmjs.com/package/patch-package) patch (`patches/@qdrant+js-client-rest+*.patch`), which neutralizes the custom dispatcher so native `fetch` handles pooling. It is applied automatically by the `postinstall` script after `npm install`.
 
 ## MCP Client Setup
 

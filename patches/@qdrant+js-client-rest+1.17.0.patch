@@ -1,0 +1,51 @@
+diff --git a/node_modules/@qdrant/js-client-rest/dist/cjs/dispatcher.js b/node_modules/@qdrant/js-client-rest/dist/cjs/dispatcher.js
+index 1d76b6a..5d46a04 100644
+--- a/node_modules/@qdrant/js-client-rest/dist/cjs/dispatcher.js
++++ b/node_modules/@qdrant/js-client-rest/dist/cjs/dispatcher.js
+@@ -2,18 +2,8 @@
+ /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-return */
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.createDispatcher = void 0;
+-const undici_1 = require("undici");
+-const createDispatcher = (connections = 25) => 
+-// eslint-disable-next-line @typescript-eslint/no-unsafe-return
+-new undici_1.Agent({
+-    // timeouts are handled by AbortSignal in our middleware
+-    bodyTimeout: 0,
+-    headersTimeout: 0,
+-    // https://stackoverflow.com/a/36437932/558180
+-    // pipelining: 1,
+-    // a sensible max connections value
+-    connections,
+-    // will be overriden by header Keep-Alive, just as sensible default
+-    keepAliveTimeout: 10000,
+-});
++// Patched: on Node >= 26 (bundled undici 8), passing this package's undici-6
++// Agent as a dispatcher to the global fetch throws UND_ERR_INVALID_ARG
++// ("invalid onError method"). Returning undefined lets native fetch handle pooling.
++const createDispatcher = (connections = 25) => undefined;
+ exports.createDispatcher = createDispatcher;
+diff --git a/node_modules/@qdrant/js-client-rest/dist/esm/dispatcher.js b/node_modules/@qdrant/js-client-rest/dist/esm/dispatcher.js
+index 73b2682..5f20e4b 100644
+--- a/node_modules/@qdrant/js-client-rest/dist/esm/dispatcher.js
++++ b/node_modules/@qdrant/js-client-rest/dist/esm/dispatcher.js
+@@ -1,15 +1,5 @@
+ /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-return */
+-import { Agent } from 'undici';
+-export const createDispatcher = (connections = 25) => 
+-// eslint-disable-next-line @typescript-eslint/no-unsafe-return
+-new Agent({
+-    // timeouts are handled by AbortSignal in our middleware
+-    bodyTimeout: 0,
+-    headersTimeout: 0,
+-    // https://stackoverflow.com/a/36437932/558180
+-    // pipelining: 1,
+-    // a sensible max connections value
+-    connections,
+-    // will be overriden by header Keep-Alive, just as sensible default
+-    keepAliveTimeout: 10000,
+-});
++// Patched: on Node >= 26 (bundled undici 8), passing this package's undici-6
++// Agent as a dispatcher to the global fetch throws UND_ERR_INVALID_ARG
++// ("invalid onError method"). Returning undefined lets native fetch handle pooling.
++export const createDispatcher = (connections = 25) => undefined;
